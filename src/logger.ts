@@ -1,7 +1,9 @@
 import { appendFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const LOG_FILE = join(process.cwd(), 'logs.txt')
+const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+const LOG_FILE = join(PROJECT_ROOT, 'logs.txt')
 
 type LogLevel = 'info' | 'warn' | 'error'
 
