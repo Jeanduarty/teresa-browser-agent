@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url'
 const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const LOG_FILE = join(PROJECT_ROOT, 'logs.txt')
 
+process.stdout.write(`[logger] log file → ${LOG_FILE}\n`)
+
 type LogLevel = 'info' | 'warn' | 'error'
 
 function format(scope: string, level: LogLevel, message: string, meta?: Record<string, unknown>) {
@@ -23,8 +25,8 @@ function serializeError(err: unknown): Record<string, unknown> {
 function writeLine(line: string) {
   try {
     appendFileSync(LOG_FILE, line + '\n', 'utf8')
-  } catch {
-    // silently ignore file write errors so logging never crashes the process
+  } catch (err) {
+    process.stderr.write(`[logger] failed to write to ${LOG_FILE}: ${err}\n`)
   }
 }
 
