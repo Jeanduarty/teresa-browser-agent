@@ -464,6 +464,7 @@ export const tiktokScrapingService = {
         const apiResult = await collectLikedVideosFromApi(page)
         if (apiResult) {
           log.info('collected_via_api_fallback', { stoppedReason: apiResult.stoppedReason, postsRead: apiResult.postsRead })
+          log.info('collected_urls', { urls: apiResult.videos.map(v => v.url) })
           return {
             status: 'completed',
             stoppedReason: apiResult.stoppedReason,
@@ -578,6 +579,7 @@ export const tiktokScrapingService = {
       }
 
       log.info('collect_completed', { stoppedReason, postsRead, pagesFetched, viewedVideos, videoCount: videos.length })
+      log.info('collected_urls', { urls: videos.map(v => v.url) })
 
       return {
         status: 'completed',
