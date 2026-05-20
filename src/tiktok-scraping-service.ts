@@ -362,6 +362,117 @@ async function fetchLikedVideosApiPage(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Player navigation (primary collection path)
+// Opens the first liked video and navigates through using keyboard/buttons.
+// The liked tab shows posts in descending order (most recently liked first),
+// so index 0 = "último post curtido". Navigation follows TikTok's internal order.
+// ---------------------------------------------------------------------------
+
+async function collectViaPlayerNavigation(
+  page: Page,
+  maxVideos: number,
+): Promise<{
+  stoppedReason: string
+  postsRead: number
+  pagesFetched: number
+  viewedVideos: number
+  videos: CollectedVideo[]
+} | null> {
+  const cards = await getVideoCards(page)
+  if (cards.length === 0) return null
+
+  // Click first card (most recently liked = descending order index 0)
+  const firstCard = cards[0]
+  await firstCard.scrollIntoViewIfNeeded().catch(() => undefined)
+  await sleep(rand(400, 800))
+
+  const linkHandle = await firstCard.$('a[href*="/video/"]').catch(() => null) ?? firstCard
+  await clickHandle(page, linkHandle as ElementHandle)
+  await sleep(rand(2000, 3500))
+
+  const videos: CollectedVideo[] = []
+  const seenUrls = new Set<string>()
+  let viewedVideos = 0
+  let consecutiveNoChange = 0
+  let stoppedReason = 'end_of_feed'
+
+  while (viewedVideos < maxVideos) {
+    const currentUrl = page.url()
+
+    if (currentUrl.includes('/video/') && !seenUrls.has(currentUrl)) {
+      seenUrls.add(currentUrl)
+      const creatorHandle = extractHandleFromUrl(currentUrl)
+      const text =
+        (await page
+          .locator('[data-e2e="browse-video-desc"]')
+          .first()
+          .textContent({ timeout: 1_000 })
+          .catch(() => '')) ?? ''
+
+      log.info('liked_post_url', { url: currentUrl, index: videos.length + 1 })
+      videos.push({ url: currentUrl, text: text.trim(), creatorHandle, createdAt: null, metrics: null })
+    }
+
+    viewedVideos++
+
+    if (videos.length >= maxVideos) {
+      stoppedReason = 'max_videos_reached'
+      break
+    }
+
+    const prevUrl = page.url()
+
+    // Strategy 1: arrow key
+    await page.keyboard.press('ArrowDown')
+    await sleep(rand(900, 1600))
+
+    if (page.url() !== prevUrl) {
+      consecutiveNoChange = 0
+      continue
+    }
+
+    // Strategy 2: next/right button selectors
+    const nextSelectors = [
+      '[data-e2e="arrow-right"]',
+      '[data-e2e="browse-video-ctrl-next"]',
+      'button[aria-label*="Next" i]',
+      'button[aria-label*="Próximo" i]',
+    ]
+
+    let navigated = false
+    for (const selector of nextSelectors) {
+      const btn = page.locator(selector).first()
+      if (!await btn.isVisible({ timeout: 500 }).catch(() => false)) continue
+      await btn.click()
+      await sleep(rand(900, 1600))
+      if (page.url() !== prevUrl) {
+        navigated = true
+        consecutiveNoChange = 0
+        break
+      }
+    }
+
+    if (!navigated) {
+      consecutiveNoChange++
+      if (consecutiveNoChange >= 2) {
+        stoppedReason = 'end_of_feed'
+        break
+      }
+    }
+  }
+
+  if (videos.length === 0) return null
+
+  return {
+    stoppedReason,
+    postsRead: videos.length,
+    pagesFetched: Math.ceil(viewedVideos / 10),
+    viewedVideos,
+    videos,
+  }
+}
+
 async function collectLikedVideosFromApi(
   page: Page,
 ): Promise<{ stoppedReason: string; postsRead: number; pagesFetched: number; viewedVideos: number; videos: CollectedVideo[] } | null> {
@@ -387,6 +498,7 @@ async function collectLikedVideosFromApi(
       seenUrls.add(video.url)
       postsRead++
 
+      log.info('liked_post_url', { url: video.url, index: postsRead })
       videos.push({
         url: video.url,
         text: video.text,
@@ -464,7 +576,6 @@ export const tiktokScrapingService = {
         const apiResult = await collectLikedVideosFromApi(page)
         if (apiResult) {
           log.info('collected_via_api_fallback', { stoppedReason: apiResult.stoppedReason, postsRead: apiResult.postsRead })
-          log.info('collected_urls', { urls: apiResult.videos.map(v => v.url) })
           return {
             status: 'completed',
             stoppedReason: apiResult.stoppedReason,
@@ -503,6 +614,35 @@ export const tiktokScrapingService = {
         }
       }
 
+      // Primary: open first liked video (most recently liked = descending order)
+      // and navigate through the player collecting each URL.
+      const playerResult = await collectViaPlayerNavigation(page, env.TIKTOK_WEB_MAX_VIDEOS).catch(err => {
+        log.warn('player_navigation_error', { error: err instanceof Error ? err.message : 'unknown' })
+        return null
+      })
+
+      if (playerResult && playerResult.videos.length > 0) {
+        log.info('collect_completed', {
+          via: 'player',
+          stoppedReason: playerResult.stoppedReason,
+          postsRead: playerResult.postsRead,
+          viewedVideos: playerResult.viewedVideos,
+          videoCount: playerResult.videos.length,
+        })
+        return {
+          status: 'completed',
+          stoppedReason: playerResult.stoppedReason,
+          postsRead: playerResult.postsRead,
+          pagesFetched: playerResult.pagesFetched,
+          viewedVideos: playerResult.viewedVideos,
+          resolvedHandle,
+          videos: playerResult.videos,
+          error: null,
+        }
+      }
+
+      // Fallback: grid card scraping
+      log.info('player_navigation_no_results_fallback_to_grid', {})
       let stoppedReason = 'end_of_feed'
       let postsRead = 0
       let pagesFetched = 0
@@ -532,11 +672,12 @@ export const tiktokScrapingService = {
           viewedVideos++
           newCardsThisRound++
 
-          if (!data?.url) continue
+              if (!data?.url) continue
           if (seenUrls.has(data.url)) continue
           seenUrls.add(data.url)
           postsRead++
 
+          log.info('liked_post_url', { url: data.url, index: postsRead })
           videos.push({
             url: data.url,
             text: data.text,
@@ -579,7 +720,6 @@ export const tiktokScrapingService = {
       }
 
       log.info('collect_completed', { stoppedReason, postsRead, pagesFetched, viewedVideos, videoCount: videos.length })
-      log.info('collected_urls', { urls: videos.map(v => v.url) })
 
       return {
         status: 'completed',
