@@ -142,7 +142,7 @@ async function clickHandle(page: Page, element: ElementHandle): Promise<void> {
     return
   }
 
-  await element.click({ timeout: 5_000 })
+  await element.click({ timeout: 5_000 }).catch(() => undefined)
 }
 
 async function clickLocator(page: Page, locator: Locator): Promise<boolean> {
@@ -570,7 +570,12 @@ export const tiktokScrapingService = {
         let newCardsThisRound = 0
 
         for (let i = viewedVideos; i < cardCount; i++) {
-          const data = await openCardAndExtractVideo(page, i)
+          let data: ExtractedVideo | null = null
+          try {
+            data = await openCardAndExtractVideo(page, i)
+          } catch (err) {
+            log.warn('card_extract_failed', { index: i, error: err instanceof Error ? err.message : 'unknown' })
+          }
           viewedVideos++
           newCardsThisRound++
 
