@@ -2,6 +2,7 @@ import 'dotenv/config'
 import Fastify from 'fastify'
 import { env } from './env-schema.js'
 import { createLogger } from './logger.js'
+import { tiktokScrapingService, type Cookie } from './tiktok-scraping-service.js'
 import { tiktokSessionService } from './tiktok-session-service.js'
 
 const log = createLogger('server')
@@ -65,6 +66,23 @@ app.post<{ Params: { id: string } }>('/sessions/:id/finalize', async (req, reply
 app.delete<{ Params: { id: string } }>('/sessions/:id', async (req, reply) => {
   await tiktokSessionService.abort(req.params.id)
   return reply.code(204).send()
+})
+
+// Coleta vídeos curtidos do TikTok usando cookies de sessão armazenados
+app.post<{ Body: { cookies: Cookie[]; handle: string | null } }>('/collect/tiktok-likes', async (req, reply) => {
+  const { cookies, handle } = req.body
+  if (!Array.isArray(cookies) || cookies.length === 0) {
+    return reply.code(400).send({ error: 'cookies é obrigatório' })
+  }
+
+  try {
+    const result = await tiktokScrapingService.collectLikedVideos(cookies, handle)
+    return reply.code(200).send(result)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'erro desconhecido'
+    log.error('collect_tiktok_likes_failed', err)
+    return reply.code(500).send({ error: message })
+  }
 })
 
 // ---------------------------------------------------------------------------
