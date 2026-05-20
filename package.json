@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "setup": "npm install && npx playwright install --with-deps chromium",
+    "setup": "npm install && npx playwright install chromium",
+    "setup:deps": "npx playwright install-deps chromium",
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
     "tunnel": "ngrok http 3338",

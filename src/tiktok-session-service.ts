@@ -305,7 +305,7 @@ export const tiktokSessionService = {
 
     const { page, context } = session
     try {
-      const handle = await extractHandle(page)
+      // Collect cookies before any navigation to avoid losing the session
       const allCookies: Cookie[] = await context.cookies()
       const cookies = allCookies.filter(c => /tiktok\.com$/.test(c.domain.replace(/^\./, '')))
 
@@ -313,6 +313,9 @@ export const tiktokSessionService = {
         await saveDebugSnapshot(page, sessionId, 'no_cookies')
         throw new Error('Nenhum cookie do TikTok encontrado após login.')
       }
+
+      // Extract handle after cookies are safe — failure here is non-fatal
+      const handle = await extractHandle(page)
 
       log.info('session_finalized', { sessionId, handle, cookieCount: cookies.length })
       return { handle, cookies }
