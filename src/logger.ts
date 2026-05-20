@@ -1,9 +1,7 @@
 import { appendFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 
-const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
-const LOG_FILE = join(PROJECT_ROOT, 'logs.txt')
+const LOG_FILE = join(process.cwd(), 'logs.txt')
 
 process.stdout.write(`[logger] log file → ${LOG_FILE}\n`)
 
