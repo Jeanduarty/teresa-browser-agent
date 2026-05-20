@@ -1,3 +1,8 @@
+import { appendFileSync } from 'node:fs'
+import { join } from 'node:path'
+
+const LOG_FILE = join(process.cwd(), 'logs.txt')
+
 type LogLevel = 'info' | 'warn' | 'error'
 
 function format(scope: string, level: LogLevel, message: string, meta?: Record<string, unknown>) {
@@ -13,21 +18,33 @@ function serializeError(err: unknown): Record<string, unknown> {
   return { value: String(err) }
 }
 
+function writeLine(line: string) {
+  try {
+    appendFileSync(LOG_FILE, line + '\n', 'utf8')
+  } catch {
+    // silently ignore file write errors so logging never crashes the process
+  }
+}
+
 export function createLogger(scope: string) {
   return {
     info(message: string, meta?: Record<string, unknown>) {
-      console.log(format(scope, 'info', message, meta))
+      const line = format(scope, 'info', message, meta)
+      console.log(line)
+      writeLine(line)
     },
     warn(message: string, meta?: Record<string, unknown>) {
-      console.warn(format(scope, 'warn', message, meta))
+      const line = format(scope, 'warn', message, meta)
+      console.warn(line)
+      writeLine(line)
     },
     error(message: string, err?: unknown, meta?: Record<string, unknown>) {
-      console.error(
-        format(scope, 'error', message, {
-          ...(meta ?? {}),
-          ...(err !== undefined ? { error: serializeError(err) } : {}),
-        }),
-      )
+      const line = format(scope, 'error', message, {
+        ...(meta ?? {}),
+        ...(err !== undefined ? { error: serializeError(err) } : {}),
+      })
+      console.error(line)
+      writeLine(line)
     },
   }
 }

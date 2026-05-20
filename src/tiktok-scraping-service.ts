@@ -244,60 +244,6 @@ async function extractCardData(page: Page, index: number): Promise<ExtractedVide
     .catch(() => null)
 }
 
-async function extractCurrentVideoData(page: Page, fallback: ExtractedVideo | null): Promise<ExtractedVideo | null> {
-  return page
-    .evaluate(fallbackData => {
-      const canonical = document.querySelector('link[rel="canonical"]') as HTMLLinkElement | null
-      const ogUrl = document.querySelector('meta[property="og:url"]') as HTMLMetaElement | null
-      const url = [window.location.href, canonical?.href, ogUrl?.content, fallbackData?.url]
-        .find(value => value && /\/video\/\d+/.test(value)) ?? null
-
-      if (!url) return null
-
-      const description =
-        (document.querySelector('[data-e2e="browse-video-desc"]')?.textContent ?? '').trim() ||
-        (document.querySelector('[data-e2e="video-desc"]')?.textContent ?? '').trim() ||
-        (document.querySelector('meta[property="og:description"]') as HTMLMetaElement | null)?.content?.trim() ||
-        fallbackData?.text ||
-        ''
-
-      const match = url.match(/tiktok\.com\/(@[\w._-]+)\/video\//)
-      return {
-        url,
-        text: description,
-        creatorHandle: match ? match[1] : fallbackData?.creatorHandle ?? null,
-      }
-    }, fallback)
-    .catch(() => fallback)
-}
-
-async function openCardAndExtractVideo(page: Page, index: number): Promise<ExtractedVideo | null> {
-  const fallback = await extractCardData(page, index)
-  const cards = await getVideoCards(page)
-  const card = cards[index]
-  if (!card) return fallback
-
-  await card.scrollIntoViewIfNeeded().catch(() => undefined)
-  await sleep(rand(env.TIKTOK_WEB_HOVER_MIN_MS, env.TIKTOK_WEB_HOVER_MAX_MS))
-  await card.hover().catch(() => undefined)
-
-  const link = await card.$(VIDEO_LINK_SELECTOR).catch(() => null)
-  const clickable = link ?? card
-  const beforeUrl = page.url()
-
-  await clickHandle(page, clickable)
-  await page.waitForURL(/\/video\/\d+/, { timeout: 8_000 }).catch(() => undefined)
-  await sleep(rand(1200, 2200))
-
-  const data = await extractCurrentVideoData(page, fallback)
-
-  if (/\/video\/\d+/.test(page.url()) && page.url() !== beforeUrl) {
-    await page.goBack({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined)
-    await sleep(rand(1200, 2200))
-  }
-
-  return data
-}
 
 async function humanScroll(page: Page): Promise<void> {
   const totalDistance = Math.round(rand(500, 900))
@@ -572,7 +518,13 @@ export const tiktokScrapingService = {
         for (let i = viewedVideos; i < cardCount; i++) {
           let data: ExtractedVideo | null = null
           try {
-            data = await openCardAndExtractVideo(page, i)
+            const card = cards[i]
+            if (card) {
+              await card.scrollIntoViewIfNeeded().catch(() => undefined)
+              await sleep(rand(env.TIKTOK_WEB_HOVER_MIN_MS, env.TIKTOK_WEB_HOVER_MAX_MS))
+              await card.hover().catch(() => undefined)
+            }
+            data = await extractCardData(page, i)
           } catch (err) {
             log.warn('card_extract_failed', { index: i, error: err instanceof Error ? err.message : 'unknown' })
           }

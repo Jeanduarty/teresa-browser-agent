@@ -1,4 +1,6 @@
 node_modules/
 dist/
 .env
+logs.txt
 .tiktok-login-debug/
+.tiktok-scraping-debug/
