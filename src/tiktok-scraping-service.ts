@@ -1,6 +1,7 @@
 /// <reference lib="dom" />
 import { randomUUID } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Browser, BrowserContext, Cookie, ElementHandle, Locator, Page } from 'playwright'
 export type { Cookie }
@@ -147,7 +148,7 @@ function normalizeTikTokVideoUrl(url: string): string {
 // ---------------------------------------------------------------------------
 
 async function captureDebugSnapshot(page: Page, reason: string): Promise<void> {
-  const dir = join(process.cwd(), '.tiktok-scraping-debug')
+  const dir = join(tmpdir(), '.tiktok-scraping-debug')
   const safeReason = reason.replace(/[^a-z0-9_-]/gi, '_').toLowerCase()
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
   const baseName = `${timestamp}-${safeReason}-${randomUUID()}`
