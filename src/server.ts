@@ -2,6 +2,7 @@ import 'dotenv/config'
 import Fastify from 'fastify'
 import { env } from './env-schema.js'
 import { createLogger } from './logger.js'
+import { mediaAudioService } from './media-audio-service.js'
 import { tiktokScrapingService, type Cookie, type LikedVideosCheckpoint } from './tiktok-scraping-service.js'
 import { tiktokSessionService } from './tiktok-session-service.js'
 
@@ -81,6 +82,26 @@ app.post<{ Body: { cookies: Cookie[]; handle: string | null; checkpoint?: LikedV
   } catch (err) {
     const message = err instanceof Error ? err.message : 'erro desconhecido'
     log.error('collect_tiktok_likes_failed', err)
+    return reply.code(500).send({ error: message })
+  }
+})
+
+app.post<{ Body: { url: string; cookies?: Cookie[] } }>('/media/audio', async (req, reply) => {
+  const { url, cookies } = req.body
+  if (!url) {
+    return reply.code(400).send({ error: 'url é obrigatória' })
+  }
+
+  try {
+    const audio = await mediaAudioService.downloadAudio(url, Array.isArray(cookies) ? cookies : [])
+    return reply
+      .code(200)
+      .header('Content-Type', audio.contentType)
+      .header('Content-Disposition', `attachment; filename="${audio.filename}"`)
+      .send(audio.buffer)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'erro desconhecido'
+    log.error('download_media_audio_failed', err, { url })
     return reply.code(500).send({ error: message })
   }
 })
