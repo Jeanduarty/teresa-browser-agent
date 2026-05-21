@@ -43,11 +43,16 @@ export type CollectResult = {
   status: 'completed' | 'failed'
   stoppedReason: string
   postsRead: number
+  newPosts: number | null
   pagesFetched: number
   viewedVideos: number
   resolvedHandle: string | null
   videos: CollectedVideo[]
   error: string | null
+}
+
+export type LikedVideosCheckpoint = {
+  jobId: string
 }
 
 type ExtractedVideo = {
@@ -70,6 +75,26 @@ type TikTokFavoriteApiItem = {
   author?: { uniqueId?: string }
   stats?: { diggCount?: number; commentCount?: number; shareCount?: number }
   statsV2?: { diggCount?: string; commentCount?: string; shareCount?: string }
+}
+
+type CheckpointRuntime = {
+  config: LikedVideosCheckpoint
+  pending: CollectedVideo[]
+  newPosts: number
+}
+
+type CheckpointDecision = {
+  shouldContinue: boolean
+  stoppedReason?: string
+  knownUrl?: string | null
+  persistedCount?: number
+}
+
+class CheckpointError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CheckpointError'
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +121,17 @@ function toNumber(value: number | string | undefined): number {
 function extractHandleFromUrl(url: string): string | null {
   const match = url.match(/tiktok\.com\/(@[\w._-]+)/)
   return match?.[1] ?? null
+}
+
+function normalizeTikTokVideoUrl(url: string): string {
+  try {
+    const parsed = new URL(url)
+    const match = parsed.pathname.match(/\/(@[\w._-]+)\/video\/(\d+)/)
+    if (!match) return url
+    return `https://www.tiktok.com/${match[1]}/video/${match[2]}`
+  } catch {
+    return url
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +255,24 @@ async function getVideoCards(page: Page): Promise<ElementHandle[]> {
   return page.$$(VIDEO_LINK_SELECTOR).catch(() => [])
 }
 
+async function getTopLeftVideoCard(cards: ElementHandle[]): Promise<ElementHandle | null> {
+  const visibleCards = await Promise.all(
+    cards.map(async card => ({
+      card,
+      box: await card.boundingBox().catch(() => null),
+      visible: await card.isVisible().catch(() => false),
+    })),
+  )
+
+  return visibleCards
+    .filter(item => item.visible && item.box)
+    .sort((a, b) => {
+      const yDiff = (a.box?.y ?? 0) - (b.box?.y ?? 0)
+      if (Math.abs(yDiff) > 8) return yDiff
+      return (a.box?.x ?? 0) - (b.box?.x ?? 0)
+    })[0]?.card ?? null
+}
+
 async function extractCardData(page: Page, index: number): Promise<ExtractedVideo | null> {
   return page
     .evaluate(
@@ -242,6 +296,83 @@ async function extractCardData(page: Page, index: number): Promise<ExtractedVide
       { idx: index, cardSelector: VIDEO_CARD_SELECTOR, linkSelector: VIDEO_LINK_SELECTOR },
     )
     .catch(() => null)
+}
+
+function createCheckpointRuntime(checkpoint?: LikedVideosCheckpoint): CheckpointRuntime | null {
+  if (!checkpoint) return null
+  return { config: checkpoint, pending: [], newPosts: 0 }
+}
+
+async function flushCheckpoint(runtime: CheckpointRuntime | null): Promise<CheckpointDecision | null> {
+  if (!runtime || runtime.pending.length === 0) return null
+
+  const videos = runtime.pending
+  runtime.pending = []
+
+  const checkpointUrl = new URL('/internal/browser-agent/tiktok-liked-batch', env.TERESA_SERVER_URL).toString()
+  const response = await fetch(checkpointUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${env.BROWSER_AGENT_SECRET}`,
+    },
+    body: JSON.stringify({
+      jobId: runtime.config.jobId,
+      videos,
+    }),
+  })
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({})) as { error?: string; message?: string }
+    throw new CheckpointError(body.error ?? body.message ?? 'Falha no checkpoint de posts curtidos.')
+  }
+
+  const decision = await response.json() as CheckpointDecision
+  runtime.newPosts += decision.persistedCount ?? 0
+  return decision
+}
+
+async function enqueueCheckpointVideo(
+  runtime: CheckpointRuntime | null,
+  video: CollectedVideo,
+): Promise<CheckpointDecision | null> {
+  if (!runtime) return null
+  runtime.pending.push(video)
+  if (runtime.pending.length < 5) return null
+  return flushCheckpoint(runtime)
+}
+
+async function waitForVideoUrlChange(page: Page, previousUrl: string, timeoutMs = 8_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const currentUrl = page.url()
+    if (currentUrl !== previousUrl && currentUrl.includes('/video/')) return true
+    await sleep(250)
+  }
+  return false
+}
+
+async function navigateToNextLikedVideo(page: Page, previousUrl: string): Promise<boolean> {
+  await page.keyboard.press('ArrowDown')
+  if (await waitForVideoUrlChange(page, previousUrl)) return true
+
+  const nextSelectors = [
+    '[data-e2e="arrow-down"]',
+    '[data-e2e="arrow-right"]',
+    '[data-e2e="browse-video-ctrl-next"]',
+    'button[aria-label*="Next" i]',
+    'button[aria-label*="Próximo" i]',
+    'button[aria-label*="Proximo" i]',
+  ]
+
+  for (const selector of nextSelectors) {
+    const btn = page.locator(selector).first()
+    if (!await btn.isVisible({ timeout: 500 }).catch(() => false)) continue
+    await btn.click()
+    if (await waitForVideoUrlChange(page, previousUrl)) return true
+  }
+
+  return false
 }
 
 
@@ -372,9 +503,11 @@ async function fetchLikedVideosApiPage(
 async function collectViaPlayerNavigation(
   page: Page,
   maxVideos: number,
+  checkpoint?: LikedVideosCheckpoint,
 ): Promise<{
   stoppedReason: string
   postsRead: number
+  newPosts: number | null
   pagesFetched: number
   viewedVideos: number
   videos: CollectedVideo[]
@@ -382,23 +515,25 @@ async function collectViaPlayerNavigation(
   const cards = await getVideoCards(page)
   if (cards.length === 0) return null
 
-  // Click first card (most recently liked = descending order index 0)
-  const firstCard = cards[0]
+  // Click the visually top-left card (most recently liked = descending order index 0)
+  const firstCard = await getTopLeftVideoCard(cards) ?? cards[0]
   await firstCard.scrollIntoViewIfNeeded().catch(() => undefined)
   await sleep(rand(400, 800))
 
   const linkHandle = await firstCard.$('a[href*="/video/"]').catch(() => null) ?? firstCard
   await clickHandle(page, linkHandle as ElementHandle)
-  await sleep(rand(2000, 3500))
+  await page.waitForURL(url => url.href.includes('/video/'), { timeout: 10_000 }).catch(() => undefined)
+  await sleep(rand(800, 1400))
 
   const videos: CollectedVideo[] = []
   const seenUrls = new Set<string>()
+  const checkpointRuntime = createCheckpointRuntime(checkpoint)
   let viewedVideos = 0
   let consecutiveNoChange = 0
   let stoppedReason = 'end_of_feed'
 
   while (viewedVideos < maxVideos) {
-    const currentUrl = page.url()
+    const currentUrl = normalizeTikTokVideoUrl(page.url())
 
     if (currentUrl.includes('/video/') && !seenUrls.has(currentUrl)) {
       seenUrls.add(currentUrl)
@@ -411,10 +546,18 @@ async function collectViaPlayerNavigation(
           .catch(() => '')) ?? ''
 
       log.info('liked_post_url', { url: currentUrl, index: videos.length + 1 })
-      videos.push({ url: currentUrl, text: text.trim(), creatorHandle, createdAt: null, metrics: null })
-    }
+      const video = { url: currentUrl, text: text.trim(), creatorHandle, createdAt: null, metrics: null }
+      videos.push(video)
+      viewedVideos++
 
-    viewedVideos++
+      const decision = await enqueueCheckpointVideo(checkpointRuntime, video)
+      if (decision && !decision.shouldContinue) {
+        stoppedReason = decision.stoppedReason ?? 'known_post_found'
+        break
+      }
+    } else {
+      viewedVideos++
+    }
 
     if (videos.length >= maxVideos) {
       stoppedReason = 'max_videos_reached'
@@ -423,50 +566,31 @@ async function collectViaPlayerNavigation(
 
     const prevUrl = page.url()
 
-    // Strategy 1: arrow key
-    await page.keyboard.press('ArrowDown')
-    await sleep(rand(900, 1600))
-
-    if (page.url() !== prevUrl) {
+    if (await navigateToNextLikedVideo(page, prevUrl)) {
       consecutiveNoChange = 0
       continue
     }
 
-    // Strategy 2: next/right button selectors
-    const nextSelectors = [
-      '[data-e2e="arrow-right"]',
-      '[data-e2e="browse-video-ctrl-next"]',
-      'button[aria-label*="Next" i]',
-      'button[aria-label*="Próximo" i]',
-    ]
-
-    let navigated = false
-    for (const selector of nextSelectors) {
-      const btn = page.locator(selector).first()
-      if (!await btn.isVisible({ timeout: 500 }).catch(() => false)) continue
-      await btn.click()
-      await sleep(rand(900, 1600))
-      if (page.url() !== prevUrl) {
-        navigated = true
-        consecutiveNoChange = 0
-        break
-      }
-    }
-
-    if (!navigated) {
-      consecutiveNoChange++
-      if (consecutiveNoChange >= 2) {
-        stoppedReason = 'end_of_feed'
-        break
-      }
+    consecutiveNoChange++
+    if (consecutiveNoChange >= 2) {
+      stoppedReason = 'end_of_feed'
+      break
     }
   }
 
   if (videos.length === 0) return null
 
+  if (stoppedReason !== 'known_post_found') {
+    const decision = await flushCheckpoint(checkpointRuntime)
+    if (decision && !decision.shouldContinue) {
+      stoppedReason = decision.stoppedReason ?? 'known_post_found'
+    }
+  }
+
   return {
     stoppedReason,
     postsRead: videos.length,
+    newPosts: checkpointRuntime?.newPosts ?? null,
     pagesFetched: Math.ceil(viewedVideos / 10),
     viewedVideos,
     videos,
@@ -475,7 +599,15 @@ async function collectViaPlayerNavigation(
 
 async function collectLikedVideosFromApi(
   page: Page,
-): Promise<{ stoppedReason: string; postsRead: number; pagesFetched: number; viewedVideos: number; videos: CollectedVideo[] } | null> {
+  checkpoint?: LikedVideosCheckpoint,
+): Promise<{
+  stoppedReason: string
+  postsRead: number
+  newPosts: number | null
+  pagesFetched: number
+  viewedVideos: number
+  videos: CollectedVideo[]
+} | null> {
   let cursor = '0'
   let stoppedReason = 'end_of_feed'
   let postsRead = 0
@@ -483,6 +615,7 @@ async function collectLikedVideosFromApi(
   let viewedVideos = 0
   const videos: CollectedVideo[] = []
   const seenUrls = new Set<string>()
+  const checkpointRuntime = createCheckpointRuntime(checkpoint)
 
   while (viewedVideos < env.TIKTOK_WEB_MAX_VIDEOS) {
     const remaining = Math.max(1, env.TIKTOK_WEB_MAX_VIDEOS - viewedVideos)
@@ -494,18 +627,27 @@ async function collectLikedVideosFromApi(
 
     for (const video of apiPage.items) {
       viewedVideos++
-      if (seenUrls.has(video.url)) continue
-      seenUrls.add(video.url)
+      const normalizedUrl = normalizeTikTokVideoUrl(video.url)
+      if (seenUrls.has(normalizedUrl)) continue
+      seenUrls.add(normalizedUrl)
       postsRead++
 
-      log.info('liked_post_url', { url: video.url, index: postsRead })
-      videos.push({
-        url: video.url,
+      const collectedVideo = {
+        url: normalizedUrl,
         text: video.text,
         creatorHandle: video.creatorHandle,
         createdAt: video.createdAt ?? null,
         metrics: video.metrics ?? null,
-      })
+      }
+
+      log.info('liked_post_url', { url: collectedVideo.url, index: postsRead })
+      videos.push(collectedVideo)
+
+      const decision = await enqueueCheckpointVideo(checkpointRuntime, collectedVideo)
+      if (decision && !decision.shouldContinue) {
+        stoppedReason = decision.stoppedReason ?? 'known_post_found'
+        break
+      }
 
       if (viewedVideos >= env.TIKTOK_WEB_MAX_VIDEOS) {
         stoppedReason = 'max_videos_reached'
@@ -513,13 +655,20 @@ async function collectLikedVideosFromApi(
       }
     }
 
-    if (stoppedReason === 'max_videos_reached') break
+    if (stoppedReason === 'max_videos_reached' || stoppedReason === 'known_post_found') break
     if (!apiPage.hasMore || apiPage.cursor === cursor) break
     cursor = apiPage.cursor
     await sleep(rand(1200, 2400))
   }
 
-  return { stoppedReason, postsRead, pagesFetched, viewedVideos, videos }
+  if (stoppedReason !== 'known_post_found') {
+    const decision = await flushCheckpoint(checkpointRuntime)
+    if (decision && !decision.shouldContinue) {
+      stoppedReason = decision.stoppedReason ?? 'known_post_found'
+    }
+  }
+
+  return { stoppedReason, postsRead, newPosts: checkpointRuntime?.newPosts ?? null, pagesFetched, viewedVideos, videos }
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +676,11 @@ async function collectLikedVideosFromApi(
 // ---------------------------------------------------------------------------
 
 export const tiktokScrapingService = {
-  async collectLikedVideos(cookies: Cookie[], handle: string | null): Promise<CollectResult> {
+  async collectLikedVideos(
+    cookies: Cookie[],
+    handle: string | null,
+    checkpoint?: LikedVideosCheckpoint,
+  ): Promise<CollectResult> {
     let browser: Browser | null = null
     let context: BrowserContext | null = null
     const videos: CollectedVideo[] = []
@@ -562,6 +715,7 @@ export const tiktokScrapingService = {
             status: 'failed',
             stoppedReason: 'session_expired',
             postsRead: 0,
+            newPosts: null,
             pagesFetched: 0,
             viewedVideos: 0,
             resolvedHandle,
@@ -573,13 +727,14 @@ export const tiktokScrapingService = {
         log.warn('liked_tab_not_found', { handle, url: page.url() })
         await captureDebugSnapshot(page, 'liked_tab_not_found')
 
-        const apiResult = await collectLikedVideosFromApi(page)
+        const apiResult = await collectLikedVideosFromApi(page, checkpoint)
         if (apiResult) {
           log.info('collected_via_api_fallback', { stoppedReason: apiResult.stoppedReason, postsRead: apiResult.postsRead })
           return {
             status: 'completed',
             stoppedReason: apiResult.stoppedReason,
             postsRead: apiResult.postsRead,
+            newPosts: apiResult.newPosts,
             pagesFetched: apiResult.pagesFetched,
             viewedVideos: apiResult.viewedVideos,
             resolvedHandle,
@@ -592,6 +747,7 @@ export const tiktokScrapingService = {
           status: 'failed',
           stoppedReason: 'liked_tab_not_found',
           postsRead: 0,
+          newPosts: null,
           pagesFetched: 0,
           viewedVideos: 0,
           resolvedHandle,
@@ -606,6 +762,7 @@ export const tiktokScrapingService = {
           status: 'failed',
           stoppedReason: 'session_expired',
           postsRead: 0,
+          newPosts: null,
           pagesFetched: 0,
           viewedVideos: 0,
           resolvedHandle,
@@ -616,7 +773,8 @@ export const tiktokScrapingService = {
 
       // Primary: open first liked video (most recently liked = descending order)
       // and navigate through the player collecting each URL.
-      const playerResult = await collectViaPlayerNavigation(page, env.TIKTOK_WEB_MAX_VIDEOS).catch(err => {
+      const playerResult = await collectViaPlayerNavigation(page, env.TIKTOK_WEB_MAX_VIDEOS, checkpoint).catch(err => {
+        if (err instanceof CheckpointError) throw err
         log.warn('player_navigation_error', { error: err instanceof Error ? err.message : 'unknown' })
         return null
       })
@@ -633,6 +791,7 @@ export const tiktokScrapingService = {
           status: 'completed',
           stoppedReason: playerResult.stoppedReason,
           postsRead: playerResult.postsRead,
+          newPosts: playerResult.newPosts,
           pagesFetched: playerResult.pagesFetched,
           viewedVideos: playerResult.viewedVideos,
           resolvedHandle,
@@ -650,6 +809,7 @@ export const tiktokScrapingService = {
       let lastScrollHeight = 0
       let consecutiveNoNewCards = 0
       const seenUrls = new Set<string>()
+      const checkpointRuntime = createCheckpointRuntime(checkpoint)
 
       while (true) {
         const cards = await getVideoCards(page)
@@ -672,19 +832,28 @@ export const tiktokScrapingService = {
           viewedVideos++
           newCardsThisRound++
 
-              if (!data?.url) continue
-          if (seenUrls.has(data.url)) continue
-          seenUrls.add(data.url)
+          if (!data?.url) continue
+          const normalizedUrl = normalizeTikTokVideoUrl(data.url)
+          if (seenUrls.has(normalizedUrl)) continue
+          seenUrls.add(normalizedUrl)
           postsRead++
 
-          log.info('liked_post_url', { url: data.url, index: postsRead })
-          videos.push({
-            url: data.url,
+          const video = {
+            url: normalizedUrl,
             text: data.text,
             creatorHandle: data.creatorHandle,
             createdAt: data.createdAt ?? null,
             metrics: data.metrics ?? null,
-          })
+          }
+
+          log.info('liked_post_url', { url: video.url, index: postsRead })
+          videos.push(video)
+
+          const decision = await enqueueCheckpointVideo(checkpointRuntime, video)
+          if (decision && !decision.shouldContinue) {
+            stoppedReason = decision.stoppedReason ?? 'known_post_found'
+            break
+          }
 
           if (viewedVideos >= env.TIKTOK_WEB_MAX_VIDEOS) {
             stoppedReason = 'max_videos_reached'
@@ -692,7 +861,7 @@ export const tiktokScrapingService = {
           }
         }
 
-        if (stoppedReason === 'max_videos_reached') break
+        if (stoppedReason === 'max_videos_reached' || stoppedReason === 'known_post_found') break
 
         if (newCardsThisRound === 0) {
           consecutiveNoNewCards++
@@ -719,12 +888,20 @@ export const tiktokScrapingService = {
         lastScrollHeight = currentHeight
       }
 
+      if (stoppedReason !== 'known_post_found') {
+        const decision = await flushCheckpoint(checkpointRuntime)
+        if (decision && !decision.shouldContinue) {
+          stoppedReason = decision.stoppedReason ?? 'known_post_found'
+        }
+      }
+
       log.info('collect_completed', { stoppedReason, postsRead, pagesFetched, viewedVideos, videoCount: videos.length })
 
       return {
         status: 'completed',
         stoppedReason,
         postsRead,
+        newPosts: checkpointRuntime?.newPosts ?? null,
         pagesFetched,
         viewedVideos,
         resolvedHandle,
@@ -738,6 +915,7 @@ export const tiktokScrapingService = {
         status: 'failed',
         stoppedReason: 'unexpected_error',
         postsRead: 0,
+        newPosts: null,
         pagesFetched: 0,
         viewedVideos: 0,
         resolvedHandle: null,
