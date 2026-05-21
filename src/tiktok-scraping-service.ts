@@ -88,6 +88,7 @@ type CheckpointDecision = {
   stoppedReason?: string
   knownUrl?: string | null
   persistedCount?: number
+  persistedUrls?: string[]
 }
 
 class CheckpointError extends Error {
