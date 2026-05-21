@@ -56,7 +56,7 @@ export const mediaAudioService = {
       const args = [
         '--no-playlist',
         '-f',
-        'bestaudio[ext=m4a]/bestaudio',
+        'bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best',
         '--extract-audio',
         '--audio-format',
         'm4a',
