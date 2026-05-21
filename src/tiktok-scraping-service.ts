@@ -109,6 +109,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  return Promise.race([
+    promise,
+    new Promise<null>(resolve => setTimeout(() => resolve(null), timeoutMs)),
+  ])
+}
+
 function toNumber(value: number | string | undefined): number {
   if (typeof value === 'number' && Number.isFinite(value)) return value
   if (typeof value === 'string') {
@@ -236,8 +243,8 @@ async function clickLikedTab(page: Page): Promise<boolean> {
 
 async function gotoLikedTab(page: Page, handle: string | null): Promise<boolean> {
   const target = handle
-    ? `https://www.tiktok.com/${handle.replace(/^@?/, '@')}`
-    : 'https://www.tiktok.com/profile'
+    ? `https://www.tiktok.com/${handle.replace(/^@?/, '@')}?t=${Date.now()}`
+    : `https://www.tiktok.com/profile?t=${Date.now()}`
   await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 30_000 })
   await sleep(rand(2000, 4000))
 
@@ -253,6 +260,26 @@ async function getVideoCards(page: Page): Promise<ElementHandle[]> {
   const cards = await page.$$(VIDEO_CARD_SELECTOR).catch(() => [])
   if (cards.length > 0) return cards
   return page.$$(VIDEO_LINK_SELECTOR).catch(() => [])
+}
+
+async function getVisibleVideoCardsInVisualOrder(page: Page): Promise<ElementHandle[]> {
+  const cards = await getVideoCards(page)
+  const visibleCards = await Promise.all(
+    cards.map(async card => ({
+      card,
+      box: await card.boundingBox().catch(() => null),
+      visible: await card.isVisible().catch(() => false),
+    })),
+  )
+
+  return visibleCards
+    .filter(item => item.visible && item.box)
+    .sort((a, b) => {
+      const yDiff = (a.box?.y ?? 0) - (b.box?.y ?? 0)
+      if (Math.abs(yDiff) > 8) return yDiff
+      return (a.box?.x ?? 0) - (b.box?.x ?? 0)
+    })
+    .map(item => item.card)
 }
 
 async function getTopLeftVideoCard(cards: ElementHandle[]): Promise<ElementHandle | null> {
@@ -296,6 +323,27 @@ async function extractCardData(page: Page, index: number): Promise<ExtractedVide
       { idx: index, cardSelector: VIDEO_CARD_SELECTOR, linkSelector: VIDEO_LINK_SELECTOR },
     )
     .catch(() => null)
+}
+
+async function extractCardElementData(card: ElementHandle): Promise<ExtractedVideo | null> {
+  return card.evaluate((element, linkSelector) => {
+    const cardElement = element as HTMLElement
+    const link = (
+      cardElement.matches(linkSelector)
+        ? cardElement
+        : cardElement.querySelector(linkSelector)
+    ) as HTMLAnchorElement | null
+    const url = link?.href ?? null
+    if (!url) return null
+
+    const text =
+      cardElement.querySelector('[data-e2e="user-post-item-desc"]')?.textContent?.trim() ??
+      link?.getAttribute('aria-label') ??
+      ''
+
+    const match = url.match(/tiktok\.com\/(@[\w._-]+)\/video\//)
+    return { url, text, creatorHandle: match ? match[1] : null }
+  }, VIDEO_LINK_SELECTOR).catch(() => null)
 }
 
 function createCheckpointRuntime(checkpoint?: LikedVideosCheckpoint): CheckpointRuntime | null {
@@ -671,6 +719,101 @@ async function collectLikedVideosFromApi(
   return { stoppedReason, postsRead, newPosts: checkpointRuntime?.newPosts ?? null, pagesFetched, viewedVideos, videos }
 }
 
+async function collectViaLikedGridOrder(
+  page: Page,
+  maxVideos: number,
+  checkpoint?: LikedVideosCheckpoint,
+): Promise<{
+  stoppedReason: string
+  postsRead: number
+  newPosts: number | null
+  pagesFetched: number
+  viewedVideos: number
+  videos: CollectedVideo[]
+} | null> {
+  let stoppedReason = 'end_of_feed'
+  let pagesFetched = 0
+  let viewedVideos = 0
+  let lastSeenCount = 0
+  let consecutiveNoNewCards = 0
+  const videos: CollectedVideo[] = []
+  const seenUrls = new Set<string>()
+  const checkpointRuntime = createCheckpointRuntime(checkpoint)
+
+  while (videos.length < maxVideos) {
+    const cards = await getVisibleVideoCardsInVisualOrder(page)
+    let newCardsThisRound = 0
+
+    for (const card of cards) {
+      const data = await extractCardElementData(card)
+      if (!data?.url) continue
+
+      const normalizedUrl = normalizeTikTokVideoUrl(data.url)
+      if (seenUrls.has(normalizedUrl)) continue
+      seenUrls.add(normalizedUrl)
+      newCardsThisRound++
+      viewedVideos++
+
+      const video = {
+        url: normalizedUrl,
+        text: data.text,
+        creatorHandle: data.creatorHandle,
+        createdAt: data.createdAt ?? null,
+        metrics: data.metrics ?? null,
+      }
+
+      log.info('liked_post_url', { via: 'grid', url: video.url, index: videos.length + 1 })
+      videos.push(video)
+
+      const decision = await enqueueCheckpointVideo(checkpointRuntime, video)
+      if (decision && !decision.shouldContinue) {
+        stoppedReason = decision.stoppedReason ?? 'known_post_found'
+        break
+      }
+
+      if (videos.length >= maxVideos) {
+        stoppedReason = 'max_videos_reached'
+        break
+      }
+    }
+
+    if (stoppedReason === 'known_post_found' || stoppedReason === 'max_videos_reached') break
+
+    if (newCardsThisRound === 0 || seenUrls.size === lastSeenCount) {
+      consecutiveNoNewCards++
+      if (consecutiveNoNewCards >= 2) {
+        stoppedReason = 'end_of_feed'
+        break
+      }
+    } else {
+      consecutiveNoNewCards = 0
+    }
+
+    lastSeenCount = seenUrls.size
+    await humanScroll(page)
+    pagesFetched++
+    await sleep(rand(env.TIKTOK_WEB_SCROLL_DELAY_MIN_MS, env.TIKTOK_WEB_SCROLL_DELAY_MAX_MS))
+  }
+
+  if (videos.length === 0) return null
+
+  if (stoppedReason !== 'known_post_found') {
+    const decision = await flushCheckpoint(checkpointRuntime)
+    if (decision && !decision.shouldContinue) {
+      stoppedReason = decision.stoppedReason ?? 'known_post_found'
+    }
+  }
+
+  return {
+    stoppedReason,
+    postsRead: videos.length,
+    newPosts: checkpointRuntime?.newPosts ?? null,
+    pagesFetched,
+    viewedVideos,
+    videos,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public service
 // ---------------------------------------------------------------------------
@@ -683,6 +826,7 @@ export const tiktokScrapingService = {
   ): Promise<CollectResult> {
     let browser: Browser | null = null
     let context: BrowserContext | null = null
+    let page: Page | null = null
     const videos: CollectedVideo[] = []
 
     try {
@@ -700,10 +844,15 @@ export const tiktokScrapingService = {
         userAgent: USER_AGENT,
         locale: 'pt-BR',
         timezoneId: 'America/Sao_Paulo',
+        serviceWorkers: 'block',
+        extraHTTPHeaders: {
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+        },
       })
       await context.addCookies(cookies)
 
-      const page = await context.newPage()
+      page = await context.newPage()
 
       const tabOpened = await gotoLikedTab(page, handle)
       const resolvedHandle = extractHandleFromUrl(page.url())
@@ -771,8 +920,33 @@ export const tiktokScrapingService = {
         }
       }
 
-      // Primary: open first liked video (most recently liked = descending order)
-      // and navigate through the player collecting each URL.
+      // Primary: the liked grid is the source of truth for descending order.
+      // TikTok's player navigation can jump through a feed order that differs
+      // from the visual "Curtido" grid, so use the grid order first.
+      const gridResult = await collectViaLikedGridOrder(page, env.TIKTOK_WEB_MAX_VIDEOS, checkpoint)
+
+      if (gridResult && gridResult.videos.length > 0) {
+        log.info('collect_completed', {
+          via: 'grid',
+          stoppedReason: gridResult.stoppedReason,
+          postsRead: gridResult.postsRead,
+          viewedVideos: gridResult.viewedVideos,
+          videoCount: gridResult.videos.length,
+        })
+        return {
+          status: 'completed',
+          stoppedReason: gridResult.stoppedReason,
+          postsRead: gridResult.postsRead,
+          newPosts: gridResult.newPosts,
+          pagesFetched: gridResult.pagesFetched,
+          viewedVideos: gridResult.viewedVideos,
+          resolvedHandle,
+          videos: gridResult.videos,
+          error: null,
+        }
+      }
+
+      // Fallback: open first liked video and navigate through the player.
       const playerResult = await collectViaPlayerNavigation(page, env.TIKTOK_WEB_MAX_VIDEOS, checkpoint).catch(err => {
         if (err instanceof CheckpointError) throw err
         log.warn('player_navigation_error', { error: err instanceof Error ? err.message : 'unknown' })
@@ -923,8 +1097,10 @@ export const tiktokScrapingService = {
         error,
       }
     } finally {
-      await context?.close().catch(() => undefined)
+      await withTimeout(page?.close().catch(() => undefined) ?? Promise.resolve(), 5_000)
+      await withTimeout(context?.close().catch(() => undefined) ?? Promise.resolve(), 10_000)
       await browser?.close().catch(() => undefined)
+      log.info('chromium_closed_after_collect', {})
     }
   },
 }
